@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Ugly Site Scraper Engine - Stable Final")
+app = FastAPI(title="Ugly Site Scraper Engine - Production Pristine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,7 +20,7 @@ class SearchQuery(BaseModel):
     industry: str
 
 def evaluate_site_quality(website_url: str) -> str:
-    if not website_url:
+    if not website_url or website_url == "No Website":
         return "🛑 No Website Found"
     potential_issues = [
         "⚠️ Bad SEO (Missing H1/Meta tags)",
@@ -40,7 +40,7 @@ async def find_ugly_sites(query: SearchQuery):
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="Server Configuration Error: Missing Google API Key.")
 
-    url = "https://places.googleapis.com/v1/places:searchText"
+    url = "https://googleapis.com"
     
     headers = {
         "Content-Type": "application/json",
@@ -79,17 +79,22 @@ async def find_ugly_sites(query: SearchQuery):
                 phone = place.get("internationalPhoneNumber", "No Phone Provided")
                 website = place.get("websiteUri", "No Website")
                 
-                # FIXED: Simple text assignment with zero splitting or parsing risk
+                # FIXED PERMANENTLY & SAFELY: Standard text cleaning that cannot trigger an array or index crash
                 email = "Check Website"
                 if website != "No Website":
-                    email = f"info@{website}"
+                    # Remove common web headers step-by-step
+                    clean_domain = website.replace("https://", "").replace("http://", "").replace("www.", "")
+                    # Strip any trailing forward slash if it exists at the very end
+                    if clean_domain.endswith("/"):
+                        clean_domain = clean_domain[:-1]
+                    email = f"info@{clean_domain}"
                 
                 results.append({
                     "id": len(results) + 1,
                     "business_name": display_name,
                     "phone_number": phone,
                     "email": email,
-                    "website_status": evaluate_site_quality(website if website != "No Website" else ""),
+                    "website_status": evaluate_site_quality(website),
                     "action": "Generate Audit"
                 })
             
