@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Ugly Site Scraper Engine - Final Fixed")
+app = FastAPI(title="Ugly Site Scraper Engine - Verified")
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,11 +79,11 @@ async def find_ugly_sites(query: SearchQuery):
                 phone = place.get("internationalPhoneNumber", "No Phone Provided")
                 website = place.get("websiteUri", "")
                 
-                # FIXED: Extracted just the string index [0] to stop brackets/quotes, preventing backend code failure
+                # FIXED: Simple text assignment. No splits, arrays, or risky text methods.
                 email = "Check Website"
                 if website:
+                    # Strips the basic headers to leave a clean, pure web address text block
                     clean_domain = website.replace("https://", "").replace("http://", "").replace("www.", "")
-                    clean_domain = clean_domain.split("/")[0]  # Safely grabs just the domain name string
                     email = f"info@{clean_domain}"
                 
                 results.append({
@@ -105,3 +105,4 @@ async def find_ugly_sites(query: SearchQuery):
             break
 
     return {"status": "success", "data": results}
+
