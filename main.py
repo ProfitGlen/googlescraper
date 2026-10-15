@@ -73,7 +73,7 @@ async def find_ugly_sites(query: SearchQuery):
         places = google_data.get("places", [])
         
         results = []
-        for idx, place in enumerate(places[:15]):  # Grabbing up to 15 live prospects per search
+        for idx, place in enumerate(places[:20]):  # Grabbing up to 20 live prospects per search
             display_name = place.get("displayName", {}).get("text", "Unknown Business")
             phone = place.get("internationalPhoneNumber", "No Phone Provided")
             website = place.get("websiteUri", "")
