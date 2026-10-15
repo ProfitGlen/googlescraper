@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Ugly Site Scraper Engine - Production Fixed")
+app = FastAPI(title="Ugly Site Scraper Engine - Production Pristine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +40,7 @@ async def find_ugly_sites(query: SearchQuery):
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="Server Configuration Error: Missing Google API Key.")
 
-    url = "https://places.googleapis.com/v1/places:searchText"
+    url = "https://googleapis.com"
     
     headers = {
         "Content-Type": "application/json",
@@ -52,7 +52,6 @@ async def find_ugly_sites(query: SearchQuery):
     next_page_token = None
     
     for page in range(3):
-        # FIXED: Added explicitly stated "pageSize" parameter to authorize nextPageToken mapping
         payload = {
             "textQuery": f"{query.industry} in {query.city}",
             "pageSize": 20
@@ -80,7 +79,12 @@ async def find_ugly_sites(query: SearchQuery):
                 phone = place.get("internationalPhoneNumber", "No Phone Provided")
                 website = place.get("websiteUri", "")
                 
-                email = f"info@{website.split('//')[-1].split('www.')[-1].split('/')}" if website else "Check Website"
+                # FIXED: Clean, rock-solid text parsing to remove brackets, slashes, and quotes from fallback emails
+                email = "Check Website"
+                if website:
+                    clean_domain = website.replace("https://", "").replace("http://", "").replace("www.", "")
+                    clean_domain = clean_domain.split("/")[0]  # Strips away trailing page paths
+                    email = f"info@{clean_domain}"
                 
                 results.append({
                     "id": len(results) + 1,
