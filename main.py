@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Ugly Site Scraper Engine - Debug Pagination")
+app = FastAPI(title="Ugly Site Scraper Engine - Production Fixed")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,9 +40,8 @@ async def find_ugly_sites(query: SearchQuery):
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="Server Configuration Error: Missing Google API Key.")
 
-    url = "https://googleapis.com"
+    url = "https://places.googleapis.com/v1/places:searchText"
     
-    # We use a broad field mask. If pageToken breaks, we gracefully fallback to at least giving page 1.
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_API_KEY,
@@ -53,8 +52,10 @@ async def find_ugly_sites(query: SearchQuery):
     next_page_token = None
     
     for page in range(3):
+        # FIXED: Added explicitly stated "pageSize" parameter to authorize nextPageToken mapping
         payload = {
-            "textQuery": f"{query.industry} in {query.city}"
+            "textQuery": f"{query.industry} in {query.city}",
+            "pageSize": 20
         }
         
         if next_page_token:
@@ -66,15 +67,10 @@ async def find_ugly_sites(query: SearchQuery):
                 
             response = requests.post(url, headers=headers, json=payload, timeout=10)
             
-            # CRITICAL SAFETY: If Google explicitly rejects page 2 or 3, don't throw away page 1 data!
             if response.status_code != 200:
                 if page == 0:
-                    # If page 1 fails, tell us exactly what error message Google sent back
-                    raise HTTPException(
-                        status_code=response.status_code, 
-                        detail=f"Google API Error on Page 1: {response.text}"
-                    )
-                break  # If page 2 or 3 fails, just return what we gathered on page 1
+                    raise HTTPException(status_code=response.status_code, detail=f"Google Error: {response.text}")
+                break
                 
             google_data = response.json()
             places = google_data.get("places", [])
@@ -101,8 +97,7 @@ async def find_ugly_sites(query: SearchQuery):
                 
         except requests.exceptions.RequestException as e:
             if page == 0:
-                raise HTTPException(status_code=500, detail=f"Network error on page 1: {str(e)}")
+                raise HTTPException(status_code=500, detail=str(e))
             break
 
     return {"status": "success", "data": results}
-
