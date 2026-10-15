@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Ugly Site Scraper Engine - Pagination")
+app = FastAPI(title="Ugly Site Scraper Engine - Debug Pagination")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,7 +42,7 @@ async def find_ugly_sites(query: SearchQuery):
 
     url = "https://googleapis.com"
     
-    # CRITICAL: Added 'nextPageToken' to the FieldMask so Google sends it to us [2]
+    # We use a broad field mask. If pageToken breaks, we gracefully fallback to at least giving page 1.
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_API_KEY,
@@ -52,25 +52,29 @@ async def find_ugly_sites(query: SearchQuery):
     results = []
     next_page_token = None
     
-    # We loop up to 3 times max to get all 60 results (20 results per page) [1]
     for page in range(3):
         payload = {
             "textQuery": f"{query.industry} in {query.city}"
         }
         
-        # If we have a token from the previous loop, feed it back to Google [2]
         if next_page_token:
-            payload["pageToken"] = next_page_token [2]
+            payload["pageToken"] = next_page_token
             
         try:
-            # Google sometimes takes a split second to register a newly generated token, 
-            # so we sleep briefly on pages 2 and 3 to ensure stability.
             if page > 0:
                 time.sleep(1.5)
                 
             response = requests.post(url, headers=headers, json=payload, timeout=10)
+            
+            # CRITICAL SAFETY: If Google explicitly rejects page 2 or 3, don't throw away page 1 data!
             if response.status_code != 200:
-                break  # Stop looping if Google encounters an error
+                if page == 0:
+                    # If page 1 fails, tell us exactly what error message Google sent back
+                    raise HTTPException(
+                        status_code=response.status_code, 
+                        detail=f"Google API Error on Page 1: {response.text}"
+                    )
+                break  # If page 2 or 3 fails, just return what we gathered on page 1
                 
             google_data = response.json()
             places = google_data.get("places", [])
@@ -91,12 +95,14 @@ async def find_ugly_sites(query: SearchQuery):
                     "action": "Generate Audit"
                 })
             
-            # Check if there is another page available. If not, break out of the loop.
-            next_page_token = google_data.get("nextPageToken") [2]
+            next_page_token = google_data.get("nextPageToken")
             if not next_page_token:
                 break
                 
-        except requests.exceptions.RequestException:
-            break  # Break loop gracefully on timeout or connection error
+        except requests.exceptions.RequestException as e:
+            if page == 0:
+                raise HTTPException(status_code=500, detail=f"Network error on page 1: {str(e)}")
+            break
 
     return {"status": "success", "data": results}
+
