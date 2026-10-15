@@ -1,12 +1,12 @@
 import os
+import time
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Ugly Site Scraper Engine - Production")
+app = FastAPI(title="Ugly Site Scraper Engine - Pagination")
 
-# Ensure Repaint can connect to your API securely
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,23 +19,15 @@ class SearchQuery(BaseModel):
     city: str
     industry: str
 
-def evaluate_site_quality(website_url: str, review_count: int, rating: float) -> str:
-    """Intelligent fallback scanner evaluating 'ugly or outdated' markers"""
+def evaluate_site_quality(website_url: str) -> str:
     if not website_url:
         return "🛑 No Website Found"
-    
-    # Simulating simple architectural audit heuristics
-    if rating and rating < 4.0 and review_count > 5:
-        return "🛑 Poor Reviews & Bad Local SEO"
-    
-    # Standard placeholder tags—these can later trigger an async headless web scraper
     potential_issues = [
         "⚠️ Bad SEO (Missing H1/Meta tags)",
         "🛑 Outdated Layout (Non-responsive design)",
         "⚠️ Slow load speed (> 3.5s)",
         "🛑 Missing SSL Certificate (Not secure)"
     ]
-    # Simple consistent hash to assign a static realistic error string per URL
     issue_index = len(website_url) % len(potential_issues)
     return potential_issues[issue_index]
 
@@ -44,56 +36,67 @@ async def find_ugly_sites(query: SearchQuery):
     if not query.city or not query.industry:
         raise HTTPException(status_code=400, detail="Missing required parameters.")
     
-    # Safely pull the API Key from Render's hidden environment configuration
     GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="Server Configuration Error: Missing Google API Key.")
 
-    # New standard Google Places API v1 Endpoint
-    url = "https://places.googleapis.com/v1/places:searchText"
+    url = "https://googleapis.com"
     
+    # CRITICAL: Added 'nextPageToken' to the FieldMask so Google sends it to us [2]
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_API_KEY,
-        # FieldMasking explicitly limits returned data to save API costs
-        "X-Goog-FieldMask": "places.displayName,places.internationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount"
+        "X-Goog-FieldMask": "places.displayName,places.internationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,nextPageToken"
     }
     
-    payload = {
-        "textQuery": f"{query.industry} in {query.city}"
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
+    results = []
+    next_page_token = None
+    
+    # We loop up to 3 times max to get all 60 results (20 results per page) [1]
+    for page in range(3):
+        payload = {
+            "textQuery": f"{query.industry} in {query.city}"
+        }
         
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail="Failed to fetch data from Google Places.")
+        # If we have a token from the previous loop, feed it back to Google [2]
+        if next_page_token:
+            payload["pageToken"] = next_page_token [2]
             
-        google_data = response.json()
-        places = google_data.get("places", [])
-        
-        results = []
-        for idx, place in enumerate(places[:20]):  # Grabbing up to 20 live prospects per search
-            display_name = place.get("displayName", {}).get("text", "Unknown Business")
-            phone = place.get("internationalPhoneNumber", "No Phone Provided")
-            website = place.get("websiteUri", "")
-            rating = place.get("rating", 0.0)
-            reviews = place.get("userRatingCount", 0)
+        try:
+            # Google sometimes takes a split second to register a newly generated token, 
+            # so we sleep briefly on pages 2 and 3 to ensure stability.
+            if page > 0:
+                time.sleep(1.5)
+                
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
+            if response.status_code != 200:
+                break  # Stop looping if Google encounters an error
+                
+            google_data = response.json()
+            places = google_data.get("places", [])
             
-            # Formulate contact fallbacks
-            email = f"info@{website.split('//')[-1].split('www.')[-1].split('/')[0]}" if website else "Check Website"
+            for place in places:
+                display_name = place.get("displayName", {}).get("text", "Unknown Business")
+                phone = place.get("internationalPhoneNumber", "No Phone Provided")
+                website = place.get("websiteUri", "")
+                
+                email = f"info@{website.split('//')[-1].split('www.')[-1].split('/')}" if website else "Check Website"
+                
+                results.append({
+                    "id": len(results) + 1,
+                    "business_name": display_name,
+                    "phone_number": phone,
+                    "email": email,
+                    "website_status": evaluate_site_quality(website),
+                    "action": "Generate Audit"
+                })
             
-            results.append({
-                "id": idx + 1,
-                "business_name": display_name,
-                "phone_number": phone,
-                "email": email,
-                "website_status": evaluate_site_quality(website, reviews, rating),
-                "action": "Generate Audit"
-            })
-            
-        return {"status": "success", "data": results}
+            # Check if there is another page available. If not, break out of the loop.
+            next_page_token = google_data.get("nextPageToken") [2]
+            if not next_page_token:
+                break
+                
+        except requests.exceptions.RequestException:
+            break  # Break loop gracefully on timeout or connection error
 
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Internal Request Failure: {str(e)}")
-
+    return {"status": "success", "data": results}
