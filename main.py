@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Ugly Site Scraper Engine - Verified")
+app = FastAPI(title="Ugly Site Scraper Engine - Stable Final")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +40,7 @@ async def find_ugly_sites(query: SearchQuery):
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="Server Configuration Error: Missing Google API Key.")
 
-    url = "https://googleapis.com"
+    url = "https://places.googleapis.com/v1/places:searchText"
     
     headers = {
         "Content-Type": "application/json",
@@ -77,21 +77,19 @@ async def find_ugly_sites(query: SearchQuery):
             for place in places:
                 display_name = place.get("displayName", {}).get("text", "Unknown Business")
                 phone = place.get("internationalPhoneNumber", "No Phone Provided")
-                website = place.get("websiteUri", "")
+                website = place.get("websiteUri", "No Website")
                 
-                # FIXED: Simple text assignment. No splits, arrays, or risky text methods.
+                # FIXED: Simple text assignment with zero splitting or parsing risk
                 email = "Check Website"
-                if website:
-                    # Strips the basic headers to leave a clean, pure web address text block
-                    clean_domain = website.replace("https://", "").replace("http://", "").replace("www.", "")
-                    email = f"info@{clean_domain}"
+                if website != "No Website":
+                    email = f"info@{website}"
                 
                 results.append({
                     "id": len(results) + 1,
                     "business_name": display_name,
                     "phone_number": phone,
                     "email": email,
-                    "website_status": evaluate_site_quality(website),
+                    "website_status": evaluate_site_quality(website if website != "No Website" else ""),
                     "action": "Generate Audit"
                 })
             
@@ -105,4 +103,3 @@ async def find_ugly_sites(query: SearchQuery):
             break
 
     return {"status": "success", "data": results}
-
