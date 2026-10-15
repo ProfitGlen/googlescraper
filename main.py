@@ -105,4 +105,3 @@ async def find_ugly_sites(query: SearchQuery):
             break
 
     return {"status": "success", "data": results}
-
