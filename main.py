@@ -284,6 +284,7 @@ def find_ugly_sites(query: SearchQuery):
                     "id": len(results) + 1,
                     "business_name": display_name,
                     "phone_number": phone,
+                    "website_url": website,
                     "email": email,
                     "email_source": "guessed" if email != "Check Website" else "none",
                     "website_status": evaluate_site_quality(website if website != "No Website" else ""),
