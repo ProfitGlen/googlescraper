@@ -1,7 +1,10 @@
 import os
+import re
+import html
 import time
 import requests
-from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, wait
+from urllib.parse import urlparse, unquote
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -20,19 +23,195 @@ class SearchQuery(BaseModel):
     city: str
     industry: str
 
-# Sites where info@<domain> would be meaningless
+
+# ---------------------------------------------------------------------------
+# Email finder settings (safe to tweak)
+# ---------------------------------------------------------------------------
+EMAIL_LOOKUP_BUDGET_SECONDS = 20   # total time allowed for ALL website lookups in one search
+EMAIL_LOOKUP_WORKERS = 15          # how many websites are checked at the same time
+MAX_PAGE_BYTES = 400_000           # only read the first ~400 KB of each page
+CONTACT_PATHS = ("/contact", "/contact-us")
+
+# Sites where info@<domain> or a scrape would be meaningless
 SKIP_HOSTS = ("facebook.com", "instagram.com", "yelp.com", "tripadvisor.com", "linktr.ee")
 
-def guess_email(website_url: str) -> str:
-    """Turn 'http://example.com/' into 'info@example.com'."""
-    if not website_url or website_url == "No Website":
-        return "Check Website"
+FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; SiteAuditBot/1.0)",
+    "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+}
+
+EMAIL_RE = re.compile(
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}"
+)
+
+# Things that look like emails but are not real contact addresses
+JUNK_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".css", ".js", ".map", ".json", ".woff", ".woff2")
+JUNK_DOMAINS = (
+    "example.com", "domain.com", "yourdomain.com", "yoursite.com", "email.com",
+    "sentry.io", "wixpress.com", "wix.com", "squarespace.com", "godaddy.com",
+    "schema.org", "w3.org",
+)
+JUNK_PREFIXES = ("noreply", "no-reply", "donotreply", "do-not-reply", "mailer-daemon", "postmaster")
+
+
+def _host_of(website_url: str) -> str:
+    """'http://www.example.com/page' -> 'example.com'"""
     if "://" not in website_url:
         website_url = "//" + website_url
-    host = (urlparse(website_url).hostname or "").removeprefix("www.")
-    if not host or any(host == h or host.endswith("." + h) for h in SKIP_HOSTS):
+    return (urlparse(website_url).hostname or "").removeprefix("www.")
+
+
+def _is_skipped(host: str) -> bool:
+    return not host or any(host == h or host.endswith("." + h) for h in SKIP_HOSTS)
+
+
+def guess_email(website_url: str) -> str:
+    """Fallback guess: 'http://example.com/' -> 'info@example.com'."""
+    if not website_url or website_url == "No Website":
+        return "Check Website"
+    host = _host_of(website_url)
+    if _is_skipped(host):
         return "Check Website"
     return f"info@{host}"
+
+
+def _clean_email(raw: str):
+    email = raw.strip().strip(".,;:<>()[]\"'").lower()
+    if not EMAIL_RE.fullmatch(email):
+        return None
+    local, _, domain = email.partition("@")
+    tld = domain.rsplit(".", 1)[-1]
+    if "." + tld in JUNK_EXTENSIONS:
+        return None
+    if any(domain == d or domain.endswith("." + d) for d in JUNK_DOMAINS):
+        return None
+    if local.startswith(JUNK_PREFIXES):
+        return None
+    return email
+
+
+def _decode_cfemail(hex_str: str) -> str:
+    """Decode Cloudflare's 'email protection' obfuscation."""
+    try:
+        data = bytes.fromhex(hex_str)
+        key = data[0]
+        return bytes(b ^ key for b in data[1:]).decode()
+    except Exception:
+        return ""
+
+
+def _extract_candidates(raw_html: str):
+    """Return a list of (email, came_from_mailto_link) found in a page."""
+    found = []
+    page = html.unescape(raw_html)
+
+    for m in re.finditer(r"mailto:([^\"'?>\s]+)", page, re.IGNORECASE):
+        for part in re.split(r"[,;]", unquote(m.group(1))):
+            email = _clean_email(part)
+            if email:
+                found.append((email, True))
+
+    for m in re.finditer(r'data-cfemail="([0-9a-fA-F]+)"', page):
+        email = _clean_email(_decode_cfemail(m.group(1)))
+        if email:
+            found.append((email, True))
+
+    text = re.sub(r"<[^>]+>", " ", page)
+    for m in EMAIL_RE.finditer(text):
+        email = _clean_email(m.group(0))
+        if email:
+            found.append((email, False))
+
+    return found
+
+
+def _domain_match(email: str, site_host: str) -> bool:
+    email_domain = email.split("@", 1)[1]
+    root = ".".join(site_host.split(".")[-2:])
+    return email_domain == site_host or email_domain == root or email_domain.endswith("." + root)
+
+
+def _best_email(candidates, site_host: str):
+    """Prefer addresses on the business's own domain, and mailto links."""
+    best, best_score = None, -1
+    for email, is_mailto in candidates:
+        score = (2 if _domain_match(email, site_host) else 0) + (1 if is_mailto else 0)
+        if score > best_score:
+            best, best_score = email, score
+    return best, best_score
+
+
+def _fetch_page(url: str) -> str:
+    try:
+        with requests.get(
+            url, headers=FETCH_HEADERS, timeout=(3, 4), stream=True, allow_redirects=True
+        ) as r:
+            if r.status_code != 200:
+                return ""
+            content_type = r.headers.get("Content-Type", "").lower()
+            if "html" not in content_type and "text" not in content_type:
+                return ""
+            content = r.raw.read(MAX_PAGE_BYTES, decode_content=True)
+            return content.decode(r.encoding or "utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def find_email_on_site(website_url: str):
+    """Look for a real email on a business's homepage, then its contact pages."""
+    host = _host_of(website_url)
+    if _is_skipped(host):
+        return None
+
+    start_url = website_url if "://" in website_url else "http://" + website_url
+    parsed = urlparse(start_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    home_html = _fetch_page(start_url)
+    if not home_html:
+        return None  # site is down or blocked, don't waste time on more pages
+
+    best, score = _best_email(_extract_candidates(home_html), host)
+    if score >= 2:
+        return best
+
+    for path in CONTACT_PATHS:
+        page_html = _fetch_page(base + path)
+        if not page_html:
+            continue
+        candidate, candidate_score = _best_email(_extract_candidates(page_html), host)
+        if candidate and candidate_score > score:
+            best, score = candidate, candidate_score
+        if score >= 2:
+            break
+
+    return best
+
+
+def fill_in_real_emails(lookups):
+    """lookups = list of (result_row, website_url). Upgrades guesses to real emails
+    where possible, within a total time budget. Anything not finished keeps its guess."""
+    if not lookups:
+        return
+
+    pool = ThreadPoolExecutor(max_workers=EMAIL_LOOKUP_WORKERS)
+    futures = {pool.submit(find_email_on_site, site): row for row, site in lookups}
+    done, not_done = wait(futures, timeout=EMAIL_LOOKUP_BUDGET_SECONDS)
+
+    for future in done:
+        try:
+            email = future.result()
+        except Exception:
+            email = None
+        if email:
+            row = futures[future]
+            row["email"] = email
+            row["email_source"] = "found on site"
+
+    for future in not_done:
+        future.cancel()
+    pool.shutdown(wait=False, cancel_futures=True)
+
 
 def evaluate_site_quality(website_url: str) -> str:
     if not website_url:
@@ -46,8 +225,11 @@ def evaluate_site_quality(website_url: str) -> str:
     issue_index = len(website_url) % len(potential_issues)
     return potential_issues[issue_index]
 
+
+# NOTE: this is a plain "def" (not "async def") on purpose. FastAPI runs it in a
+# worker thread, so the waiting on Google and on websites doesn't freeze the server.
 @app.post("/search")
-async def find_ugly_sites(query: SearchQuery):
+def find_ugly_sites(query: SearchQuery):
     if not query.city or not query.industry:
         raise HTTPException(status_code=400, detail="Missing required parameters.")
 
@@ -64,6 +246,7 @@ async def find_ugly_sites(query: SearchQuery):
     }
 
     results = []
+    lookups = []  # (result_row, website) pairs to check for a real email
     next_page_token = None
 
     for page in range(3):
@@ -94,16 +277,22 @@ async def find_ugly_sites(query: SearchQuery):
                 phone = place.get("internationalPhoneNumber", "No Phone Provided")
                 website = place.get("websiteUri", "No Website")
 
+                # Start with the info@domain guess; real emails replace it below.
                 email = guess_email(website)
 
-                results.append({
+                row = {
                     "id": len(results) + 1,
                     "business_name": display_name,
                     "phone_number": phone,
                     "email": email,
+                    "email_source": "guessed" if email != "Check Website" else "none",
                     "website_status": evaluate_site_quality(website if website != "No Website" else ""),
                     "action": "Generate Audit"
-                })
+                }
+                results.append(row)
+
+                if email != "Check Website":
+                    lookups.append((row, website))
 
             next_page_token = google_data.get("nextPageToken")
             if not next_page_token:
@@ -113,5 +302,7 @@ async def find_ugly_sites(query: SearchQuery):
             if page == 0:
                 raise HTTPException(status_code=500, detail=str(e))
             break
+
+    fill_in_real_emails(lookups)
 
     return {"status": "success", "data": results}
