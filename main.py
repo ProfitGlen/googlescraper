@@ -6,6 +6,7 @@ import hashlib
 import threading
 import time
 import requests
+import urllib3
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Union
@@ -13,6 +14,9 @@ from urllib.parse import urlparse, unquote
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# We sometimes open a site with a broken certificate on purpose, to check it and read its page.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(title="Ugly Site Scraper Engine - Stable Final")
 
@@ -71,7 +75,10 @@ def _host_of(website_url: str) -> str:
     """'http://www.example.com/page' -> 'example.com'"""
     if "://" not in website_url:
         website_url = "//" + website_url
-    return (urlparse(website_url).hostname or "").removeprefix("www.")
+    try:
+        return (urlparse(website_url).hostname or "").removeprefix("www.")
+    except ValueError:  # a malformed address such as "http://[oops"
+        return ""
 
 
 def _is_skipped(host: str) -> bool:
@@ -154,10 +161,10 @@ def _best_email(candidates, site_host: str):
     return best, best_score
 
 
-def _fetch_page(url: str) -> str:
+def _fetch_page(url: str, verify: bool = True) -> str:
     try:
         with requests.get(
-            url, headers=FETCH_HEADERS, timeout=(3, 4), stream=True, allow_redirects=True
+            url, headers=FETCH_HEADERS, timeout=(3, 4), stream=True, allow_redirects=True, verify=verify
         ) as r:
             if r.status_code != 200:
                 return ""
@@ -170,26 +177,145 @@ def _fetch_page(url: str) -> str:
         return ""
 
 
-def find_email_on_site(website_url: str):
-    """Look for a real email on a business's homepage, then its contact pages."""
-    host = _host_of(website_url)
-    if _is_skipped(host):
-        return None
+# ---------------------------------------------------------------------------
+# Website checks (safe to tweak)
+# ---------------------------------------------------------------------------
+SLOW_SECONDS = 3.5                  # a homepage that takes longer than this to load is reported as slow
+OUTDATED_YEARS = 3                  # a copyright year this old (or older) is reported as a sign of an old site
+MIN_TEXT_FOR_CONTENT_CHECKS = 200   # pages with less visible text are probably built with JavaScript, so the title/H1/description checks are skipped
+LEGACY_TAGS = ("font", "center", "marquee", "blink", "frameset")   # HTML tags from the 1990s-2000s
 
-    start_url = website_url if "://" in website_url else "http://" + website_url
-    parsed = urlparse(start_url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
 
-    home_html = _fetch_page(start_url)
-    if not home_html:
-        return None  # site is down or blocked, don't waste time on more pages
+def _fetch_home(url: str) -> dict:
+    """Open a homepage and report what happened: its text, where it ended up after redirects,
+    how long it took, and whether its security certificate is broken."""
+    out = {"html": "", "final_url": url, "status": None, "seconds": None, "ssl_error": False}
+    verify = True
+    for _ in range(2):
+        started = time.perf_counter()
+        try:
+            with requests.get(
+                url, headers=FETCH_HEADERS, timeout=(3, 4), stream=True, allow_redirects=True, verify=verify
+            ) as r:
+                out["status"] = r.status_code
+                out["final_url"] = r.url
+                content_type = r.headers.get("Content-Type", "").lower()
+                if r.status_code == 200 and ("html" in content_type or "text" in content_type):
+                    content = r.raw.read(MAX_PAGE_BYTES, decode_content=True)
+                    out["html"] = content.decode(r.encoding or "utf-8", errors="ignore")
+                out["seconds"] = time.perf_counter() - started
+                return out
+        except requests.exceptions.SSLError:
+            out["ssl_error"] = True
+            verify = False  # open the page anyway so the other checks and the email search still work
+        except Exception:
+            return out  # couldn't open the site at all (status stays None)
+    return out
 
+
+def _https_works(netloc: str) -> bool:
+    """For a site that stayed on plain http: does https work at all?"""
+    try:
+        with requests.get(f"https://{netloc}/", headers=FETCH_HEADERS, timeout=(3, 4), stream=True) as r:
+            return r.status_code < 500
+    except Exception:
+        return False
+
+
+def _html_text(raw_html: str) -> str:
+    """The words a visitor would see on the page (no tags, scripts or styles)."""
+    page = re.sub(r"(?is)<(script|style|noscript)\b.*?</\1>", " ", raw_html)
+    page = re.sub(r"(?s)<!--.*?-->", " ", page)
+    page = re.sub(r"<[^>]+>", " ", page)
+    return re.sub(r"\s+", " ", html.unescape(page)).strip()
+
+
+def _meta_content(raw_html: str, name: str) -> str:
+    """The content of <meta name="..."> (for example 'viewport' or 'description'), or ''."""
+    for tag in re.findall(r"(?is)<meta\b[^>]*>", raw_html):
+        found_name = re.search(r"""(?i)\bname\s*=\s*["']?([^"'\s>]+)""", tag)
+        if found_name and found_name.group(1).lower() == name:
+            content = re.search(r"""(?is)\bcontent\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", tag)
+            if content:
+                return (content.group(1) or content.group(2) or content.group(3) or "").strip()
+    return ""
+
+
+def _copyright_year(text: str):
+    """The newest year that appears right after a copyright sign or the word 'copyright', or None."""
+    years = []
+    pattern = r"(?i)(?:©|\(c\)|copyright)[^0-9]{0,40}((?:19|20)\d{2})(?:\s*[-–—]\s*((?:19|20)\d{2}))?"
+    for match in re.finditer(pattern, text):
+        years.append(int(match.group(2) or match.group(1)))
+    return max(years) if years else None
+
+
+def _site_issues(home: dict) -> list:
+    """Turn what we saw on a homepage into a list of problems, most serious first (empty = none found)."""
+    issues = []
+    raw = home["html"]
+    text = _html_text(raw)
+    has_content = len(text) >= MIN_TEXT_FOR_CONTENT_CHECKS
+
+    # Security
+    final = urlparse(home["final_url"])
+    if home["ssl_error"]:
+        issues.append("🛑 SSL certificate problem (browsers show a security warning)")
+    elif final.scheme == "http" and not _https_works(final.netloc):
+        issues.append("🛑 Not secure (site doesn't use https)")
+
+    # Mobile
+    if not _meta_content(raw, "viewport"):
+        issues.append("🛑 Not mobile-friendly (no mobile viewport setting)")
+
+    # Signs of an old site
+    if has_content:
+        signs = []
+        year = _copyright_year(text)
+        if year and year <= datetime.now(timezone.utc).year - OUTDATED_YEARS:
+            signs.append(f"page shows © {year}")
+        legacy = sorted({tag.lower() for tag in re.findall(r"(?i)<(" + "|".join(LEGACY_TAGS) + r")\b", raw)})
+        if legacy:
+            signs.append("old HTML tags: " + ", ".join(legacy))
+        if signs:
+            issues.append("⚠️ Looks outdated (" + "; ".join(signs) + ")")
+
+    # Speed
+    if home["seconds"] is not None and home["seconds"] > SLOW_SECONDS:
+        issues.append(f"⚠️ Slow load speed ({home['seconds']:.1f}s)")
+
+    # Search-engine basics
+    if has_content:
+        missing = []
+        title = re.search(r"(?is)<title[^>]*>(.*?)</title>", raw)
+        if not (title and title.group(1).strip()):
+            missing.append("page title")
+        if not _meta_content(raw, "description"):
+            missing.append("meta description")
+        if not re.search(r"(?i)<h1\b", raw):
+            missing.append("H1 heading")
+        if missing:
+            issues.append("⚠️ Bad SEO (missing " + ", ".join(missing) + ")")
+
+    return issues
+
+
+def _summarize(issues: list) -> str:
+    """One-line status: the most serious problem, plus how many others there are."""
+    if not issues:
+        return "✅ Passed our basic checks"
+    extra = len(issues) - 1
+    return issues[0] + (f" (+{extra} more)" if extra else "")
+
+
+def find_email_on_site(home_html: str, base: str, host: str, verify: bool = True):
+    """Look for a real email in the homepage text we already have, then on its contact pages."""
     best, score = _best_email(_extract_candidates(home_html), host)
     if score >= 2:
         return best
 
     for path in CONTACT_PATHS:
-        page_html = _fetch_page(base + path)
+        page_html = _fetch_page(base + path, verify=verify)
         if not page_html:
             continue
         candidate, candidate_score = _best_email(_extract_candidates(page_html), host)
@@ -201,42 +327,71 @@ def find_email_on_site(website_url: str):
     return best
 
 
-def fill_in_real_emails(lookups):
-    """lookups = list of (result_row, website_url). Upgrades guesses to real emails
-    where possible, within a total time budget. Anything not finished keeps its guess."""
+def analyze_site(website_url: str) -> dict:
+    """Open a business's website once. Returns its real email (if one was found), the problems
+    found, and a one-line status. Runs inside a worker thread."""
+    host = _host_of(website_url)
+    start_url = website_url if "://" in website_url else "http://" + website_url
+
+    home = _fetch_home(start_url)
+    status = home["status"]
+    if status is None:
+        return {"email": None, "checked": False, "issues": [], "status": "Not checked (couldn't open the site)"}
+    if status in (401, 403, 429):
+        return {"email": None, "checked": False, "issues": [], "status": "Not checked (the site blocked our check)"}
+    if status != 200:
+        issues = [f"⚠️ Website returned an error (HTTP {status})"]
+        return {"email": None, "checked": True, "issues": issues, "status": _summarize(issues)}
+    if not home["html"]:
+        return {"email": None, "checked": False, "issues": [], "status": "Not checked (couldn't read the page)"}
+
+    final = urlparse(home["final_url"])
+    base = f"{final.scheme}://{final.netloc}"
+    issues = _site_issues(home)
+    email = find_email_on_site(home["html"], base, host, verify=not home["ssl_error"])
+    return {"email": email, "checked": True, "issues": issues, "status": _summarize(issues)}
+
+
+def check_websites(lookups):
+    """lookups = list of (result_row, website_url). Opens each website (several at a time, within
+    a total time budget) and fills in its real email and its website status. Anything not finished
+    keeps its guessed email and its 'Not checked' status."""
     if not lookups:
         return
 
     pool = ThreadPoolExecutor(max_workers=EMAIL_LOOKUP_WORKERS)
-    futures = {pool.submit(find_email_on_site, site): row for row, site in lookups}
+    futures = {pool.submit(analyze_site, site): row for row, site in lookups}
     done, not_done = wait(futures, timeout=EMAIL_LOOKUP_BUDGET_SECONDS)
 
     for future in done:
+        row = futures[future]
         try:
-            email = future.result()
+            result = future.result()
         except Exception:
-            email = None
-        if email:
-            row = futures[future]
-            row["email"] = email
+            row["website_status"] = "Not checked (something went wrong)"
+            continue
+        if result["email"]:
+            row["email"] = result["email"]
             row["email_source"] = "found on site"
+        row["website_checked"] = result["checked"]
+        row["website_issues"] = result["issues"]
+        row["website_status"] = result["status"]
 
     for future in not_done:
         future.cancel()
     pool.shutdown(wait=False, cancel_futures=True)
 
 
-def evaluate_site_quality(website_url: str) -> str:
-    if not website_url:
-        return "🛑 No Website Found"
-    potential_issues = [
-        "⚠️ Bad SEO (Missing H1/Meta tags)",
-        "🛑 Outdated Layout (Non-responsive design)",
-        "⚠️ Slow load speed (> 3.5s)",
-        "🛑 Missing SSL Certificate (Not secure)"
-    ]
-    issue_index = len(website_url) % len(potential_issues)
-    return potential_issues[issue_index]
+def starting_site_status(website: str):
+    """Status for a business before (or without) opening its website: (status text, checked)."""
+    if not website or website == "No Website":
+        return "🛑 No Website Found", True
+    host = _host_of(website)
+    if not host:
+        return "Not checked (the website address looks invalid)", False
+    if _is_skipped(host):
+        return "⚠️ Only a social media or directory page is listed (no website of its own)", True
+    return "Not checked (ran out of time)", False
 
 
 # ---------------------------------------------------------------------------
@@ -394,8 +549,10 @@ def _run_search(query: SearchQuery):
                 phone = place.get("internationalPhoneNumber", "No Phone Provided")
                 website = place.get("websiteUri", "No Website")
 
-                # Start with the info@domain guess; real emails replace it below.
+                # Start with the info@domain guess and a "Not checked" status;
+                # the website check below replaces them with real findings.
                 email = guess_email(website)
+                site_status, site_checked = starting_site_status(website)
 
                 row = {
                     "id": len(results) + 1,
@@ -404,7 +561,9 @@ def _run_search(query: SearchQuery):
                     "website_url": website,
                     "email": email,
                     "email_source": "guessed" if email != "Check Website" else "none",
-                    "website_status": evaluate_site_quality(website if website != "No Website" else ""),
+                    "website_status": site_status,
+                    "website_issues": [],
+                    "website_checked": site_checked,
                     "action": "Generate Audit"
                 }
                 results.append(row)
@@ -428,7 +587,7 @@ def _run_search(query: SearchQuery):
                 raise HTTPException(status_code=500, detail=str(e))
             break
 
-    fill_in_real_emails(lookups)
+    check_websites(lookups)
 
     credits_used = credits_for_results(len(results))
 
@@ -442,3 +601,4 @@ def _run_search(query: SearchQuery):
         "receipt": _sign(f"rfl-receipt|{query.pass_id}|{credits_used}"),
         "data": results,
     }
+
