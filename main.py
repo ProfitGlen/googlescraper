@@ -1,9 +1,14 @@
 import os
 import re
 import html
+import hmac
+import hashlib
+import threading
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, wait
+from datetime import datetime, timezone
+from typing import Union
 from urllib.parse import urlparse, unquote
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +27,14 @@ app.add_middleware(
 class SearchQuery(BaseModel):
     city: str
     industry: str
+    # The signed "pass" Repaint issues for each search. This backend checks the signature,
+    # so the customer can't change their credit balance. If pass_id, credits_available or
+    # expires is missing the search fails loudly (422), and a missing signature is
+    # rejected as invalid (401), so nothing is silently given away for free.
+    pass_id: Union[str, int]
+    credits_available: int
+    expires: str              # UTC time like "2026-10-16T13:45:00Z"
+    signature: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -226,12 +239,112 @@ def evaluate_site_quality(website_url: str) -> str:
     return potential_issues[issue_index]
 
 
+# ---------------------------------------------------------------------------
+# Credit pricing: how many credits one search costs, based on results returned
+# ---------------------------------------------------------------------------
+# Each pair is (most results this tier covers, credits charged). Edit to change prices.
+CREDIT_TIERS = (
+    (20, 1),   # 1-20 results  -> 1 credit
+    (40, 2),   # 21-40 results -> 2 credits
+    (60, 3),   # 41-60 results -> 3 credits
+)
+
+
+def credits_for_results(result_count: int) -> int:
+    """No results costs nothing; otherwise use the first tier the count fits in."""
+    if result_count <= 0:
+        return 0
+    for max_results, credits in CREDIT_TIERS:
+        if result_count <= max_results:
+            return credits
+    return CREDIT_TIERS[-1][1]  # more than 60 (can't happen today) -> top tier
+
+
+MAX_RESULTS = CREDIT_TIERS[-1][0]   # the most results one search can ever return (60)
+
+
+def max_results_for_credits(credits_available: int) -> int:
+    """How many results a customer with this many credits left can be given.
+    1 credit -> 20, 2 credits -> 40, 3 or more -> 60, none -> 0."""
+    affordable = [max_results for max_results, credits in CREDIT_TIERS if credits <= credits_available]
+    return max(affordable) if affordable else 0
+
+
+# ---------------------------------------------------------------------------
+# Signed pass: Repaint signs each search request (the "pass") with a shared secret, and
+# this backend signs a receipt for each finished search. Set the secret on Render under
+# Environment as RFL_SECRET (the same value Repaint uses).
+# ---------------------------------------------------------------------------
+def _sign(message: str) -> str:
+    secret = os.getenv("RFL_SECRET")
+    if not secret:
+        raise HTTPException(status_code=500, detail="Server Configuration Error: Missing RFL_SECRET.")
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+
+def check_pass(query: SearchQuery) -> datetime:
+    """Reject the search unless Repaint's signature on the pass is valid and not expired.
+    Returns the time the pass expires."""
+    message = f"rfl-pass|{query.pass_id}|{query.credits_available}|{query.expires}"
+    if not hmac.compare_digest(_sign(message).encode(), (query.signature or "").encode()):
+        raise HTTPException(status_code=401, detail="Invalid pass signature.")
+    try:
+        expires_at = datetime.strptime(query.expires, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid pass expiry.")
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Pass has expired.")
+    return expires_at
+
+
+# ---------------------------------------------------------------------------
+# One search per pass: remember which passes have been used, so a customer can't run
+# several searches on one pass. This is kept in memory, so it resets whenever the server
+# restarts or redeploys (passes expire quickly, which keeps that gap small).
+# ---------------------------------------------------------------------------
+_used_passes = {}                   # pass_id -> the time that pass expires
+_used_passes_lock = threading.Lock()
+
+
+def claim_pass(pass_id, expires_at: datetime) -> None:
+    """Mark a pass as used. If it was already used, refuse the search."""
+    key = str(pass_id)  # 123 and "123" are the same pass (they have the same signature)
+    now = datetime.now(timezone.utc)
+    with _used_passes_lock:
+        for old_key in [k for k, exp in _used_passes.items() if exp < now]:
+            del _used_passes[old_key]  # forget passes that have expired anyway
+        if key in _used_passes:
+            raise HTTPException(status_code=401, detail="This pass has already been used.")
+        _used_passes[key] = expires_at
+
+
+def release_pass(pass_id) -> None:
+    """Hand a pass back if the search failed before returning anything, so the customer can retry."""
+    with _used_passes_lock:
+        _used_passes.pop(str(pass_id), None)
+
+
 # NOTE: this is a plain "def" (not "async def") on purpose. FastAPI runs it in a
 # worker thread, so the waiting on Google and on websites doesn't freeze the server.
 @app.post("/search")
 def find_ugly_sites(query: SearchQuery):
+    expires_at = check_pass(query)          # first, so callers without a valid signed pass learn nothing
+    claim_pass(query.pass_id, expires_at)   # each pass works for exactly one search
+    try:
+        return _run_search(query)
+    except Exception:
+        release_pass(query.pass_id)         # nothing was returned, so let the customer retry
+        raise
+
+
+def _run_search(query: SearchQuery):
     if not query.city or not query.industry:
         raise HTTPException(status_code=400, detail="Missing required parameters.")
+
+    # Work out how many results this customer's remaining credits can pay for.
+    max_results = max_results_for_credits(query.credits_available)
+    if max_results == 0:
+        raise HTTPException(status_code=402, detail="Not enough credits to run a search.")
 
     GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
     if not GOOGLE_API_KEY:
@@ -248,6 +361,7 @@ def find_ugly_sites(query: SearchQuery):
     results = []
     lookups = []  # (result_row, website) pairs to check for a real email
     next_page_token = None
+    credit_limited = False  # becomes True if we held back results to stay within the credits
 
     for page in range(3):
         payload = {
@@ -273,6 +387,9 @@ def find_ugly_sites(query: SearchQuery):
             places = google_data.get("places", [])
 
             for place in places:
+                if len(results) >= max_results:
+                    credit_limited = True  # a result was left out to stay within the credits
+                    break
                 display_name = place.get("displayName", {}).get("text", "Unknown Business")
                 phone = place.get("internationalPhoneNumber", "No Phone Provided")
                 website = place.get("websiteUri", "No Website")
@@ -296,6 +413,13 @@ def find_ugly_sites(query: SearchQuery):
                     lookups.append((row, website))
 
             next_page_token = google_data.get("nextPageToken")
+
+            if len(results) >= max_results:
+                # We have all the credits cover, so don't ask Google for more pages.
+                if next_page_token:
+                    credit_limited = True
+                break
+
             if not next_page_token:
                 break
 
@@ -306,4 +430,15 @@ def find_ugly_sites(query: SearchQuery):
 
     fill_in_real_emails(lookups)
 
-    return {"status": "success", "data": results}
+    credits_used = credits_for_results(len(results))
+
+    return {
+        "status": "success",
+        "result_count": len(results),
+        "credits_used": credits_used,
+        # True when more results exist but weren't returned because of the credit limit
+        "more_results_available": credit_limited and max_results < MAX_RESULTS,
+        # Proof, signed with the shared secret, of how many credits this search used
+        "receipt": _sign(f"rfl-receipt|{query.pass_id}|{credits_used}"),
+        "data": results,
+    }
